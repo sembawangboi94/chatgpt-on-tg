@@ -30,6 +30,21 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def supports_reasoning_effort(model: str) -> bool:
+    normalized = model.strip().lower()
+    return normalized.startswith("gpt-5")
+
+
+def supported_verbosity(model: str, requested: str) -> str:
+    normalized_model = model.strip().lower()
+    normalized_requested = requested.strip().lower()
+
+    if normalized_model == "gpt-4.1-mini" and normalized_requested == "high":
+        return "medium"
+
+    return normalized_requested or "medium"
+
+
 def load_dotenv(path: str = ".env") -> None:
     if not os.path.exists(path):
         return
@@ -53,7 +68,26 @@ def load_dotenv(path: str = ".env") -> None:
             if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
                 value = value[1:-1]
 
-            os.environ.setdefault(key, value)
+            os.environ[key] = value
+
+
+def extract_response_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    chunks = []
+    for item in getattr(response, "output", []) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", None) == "output_text":
+                text = getattr(content, "text", "")
+                if text:
+                    chunks.append(text)
+
+    return "\n".join(chunk.strip() for chunk in chunks if chunk and chunk.strip()).strip()
 
 
 @dataclass
@@ -224,9 +258,13 @@ class TelegramBot:
     def load_bot_identity(self) -> None:
         self.bot_user = self.request("getMe")
         LOGGER.info(
-            "bot identity loaded username=@%s id=%s",
+            "bot identity loaded username=@%s id=%s model=%s reasoning_effort=%s text_verbosity=%s max_output_tokens=%s",
             self.bot_user.get("username"),
             self.bot_user.get("id"),
+            self.settings.openai_model,
+            self.settings.openai_reasoning_effort,
+            supported_verbosity(self.settings.openai_model, self.settings.openai_text_verbosity),
+            self.settings.openai_max_output_tokens,
         )
 
     @property
@@ -294,14 +332,22 @@ class TelegramBot:
         ]
 
     def generate_reply(self, message: dict[str, Any], memory_rows: list[sqlite3.Row]) -> str:
-        response = self.openai_client.responses.create(
-            model=self.settings.openai_model,
-            input=self.build_prompt(message, memory_rows),
-            reasoning={"effort": self.settings.openai_reasoning_effort},
-            text={"verbosity": self.settings.openai_text_verbosity},
-            max_output_tokens=self.settings.openai_max_output_tokens,
-        )
-        text = getattr(response, "output_text", "").strip()
+        request_kwargs = {
+            "model": self.settings.openai_model,
+            "input": self.build_prompt(message, memory_rows),
+            "text": {
+                "verbosity": supported_verbosity(
+                    self.settings.openai_model,
+                    self.settings.openai_text_verbosity,
+                )
+            },
+            "max_output_tokens": self.settings.openai_max_output_tokens,
+        }
+        if supports_reasoning_effort(self.settings.openai_model):
+            request_kwargs["reasoning"] = {"effort": self.settings.openai_reasoning_effort}
+
+        response = self.openai_client.responses.create(**request_kwargs)
+        text = extract_response_text(response)
         if not text:
             raise RuntimeError("OpenAI response did not contain output_text")
         return text
