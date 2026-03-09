@@ -71,23 +71,55 @@ def load_dotenv(path: str = ".env") -> None:
             os.environ[key] = value
 
 
+def response_field(value: Any, field: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(field, default)
+    return getattr(value, field, default)
+
+
 def extract_response_text(response: Any) -> str:
-    output_text = getattr(response, "output_text", None)
+    output_text = response_field(response, "output_text")
     if isinstance(output_text, str) and output_text.strip():
         return output_text.strip()
 
     chunks = []
-    for item in getattr(response, "output", []) or []:
-        if getattr(item, "type", None) != "message":
+    for item in response_field(response, "output", []) or []:
+        if response_field(item, "type") != "message":
             continue
 
-        for content in getattr(item, "content", []) or []:
-            if getattr(content, "type", None) == "output_text":
-                text = getattr(content, "text", "")
+        for content in response_field(item, "content", []) or []:
+            if response_field(content, "type") == "output_text":
+                text = response_field(content, "text", "")
                 if text:
                     chunks.append(text)
 
     return "\n".join(chunk.strip() for chunk in chunks if chunk and chunk.strip()).strip()
+
+
+def summarize_response_output(response: Any) -> str:
+    summaries = []
+    for item in response_field(response, "output", []) or []:
+        item_type = response_field(item, "type", "unknown")
+        content_types = [
+            response_field(content, "type", "unknown")
+            for content in response_field(item, "content", []) or []
+        ]
+        if content_types:
+            summaries.append(f"{item_type}:{','.join(content_types)}")
+        else:
+            summaries.append(item_type)
+
+    status = response_field(response, "status", "unknown")
+    if not summaries:
+        return f"status={status} output=[]"
+    return f"status={status} output={summaries}"
+
+
+def response_incomplete_reason(response: Any) -> Optional[str]:
+    incomplete_details = response_field(response, "incomplete_details")
+    if not incomplete_details:
+        return None
+    return response_field(incomplete_details, "reason")
 
 
 @dataclass
@@ -336,6 +368,7 @@ class TelegramBot:
             "model": self.settings.openai_model,
             "input": self.build_prompt(message, memory_rows),
             "text": {
+                "format": {"type": "text"},
                 "verbosity": supported_verbosity(
                     self.settings.openai_model,
                     self.settings.openai_text_verbosity,
@@ -348,8 +381,23 @@ class TelegramBot:
 
         response = self.openai_client.responses.create(**request_kwargs)
         text = extract_response_text(response)
+        incomplete_reason = response_incomplete_reason(response)
+        if not text and incomplete_reason == "max_output_tokens":
+            retry_max_output_tokens = min(max(self.settings.openai_max_output_tokens * 2, 2000), 4096)
+            LOGGER.warning(
+                "response hit max_output_tokens during reasoning; retrying with max_output_tokens=%s",
+                retry_max_output_tokens,
+            )
+            retry_kwargs = dict(request_kwargs)
+            retry_kwargs["max_output_tokens"] = retry_max_output_tokens
+            response = self.openai_client.responses.create(**retry_kwargs)
+            text = extract_response_text(response)
+
         if not text:
-            raise RuntimeError("OpenAI response did not contain output_text")
+            raise RuntimeError(
+                "OpenAI response did not contain text content "
+                f"({summarize_response_output(response)})"
+            )
         return text
 
     def send_group_reply(self, chat_id: int, reply_to_message_id: int, text: str) -> dict[str, Any]:
