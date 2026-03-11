@@ -16,6 +16,7 @@ The bot:
 - optionally also responds to replies to its own messages
 - sends addressed messages to OpenAI Responses API
 - replies back in the same group
+- sends generated images to Telegram with `sendPhoto` when the OpenAI response contains image output
 - logs every inbound and outbound text message to SQLite
 - builds short rolling memory per Telegram chat from recent SQLite rows
 
@@ -45,6 +46,7 @@ OPENAI_MODEL="gpt-5.1"
 OPENAI_REASONING_EFFORT="high"
 OPENAI_TEXT_VERBOSITY="high"
 OPENAI_MAX_OUTPUT_TOKENS="1400"
+OPENAI_ENABLE_IMAGE_GENERATION="false"
 ```
 
 5. Add the bot to a Telegram group.
@@ -66,3 +68,5 @@ The SQLite database is created automatically at `SQLITE_PATH` and stores all inb
 - Addressing currently means a direct `@bot_username` mention, plus replies to the bot when `MENTION_FALLBACK_TO_REPLY=true`.
 - `.env` is loaded automatically on startup if the file exists.
 - `OPENAI_REASONING_EFFORT`, `OPENAI_TEXT_VERBOSITY`, and `OPENAI_MAX_OUTPUT_TOKENS` control depth and response length for the Responses API.
+- Set `OPENAI_ENABLE_IMAGE_GENERATION=true` if you want the Responses API call to allow image generation output.
+- If an OpenAI response contains `image_generation_call` output items, the bot uploads those images to Telegram using `sendPhoto`.

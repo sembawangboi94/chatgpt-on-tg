@@ -5,8 +5,12 @@ import signal
 import sqlite3
 import sys
 import time
+import base64
+import html
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from typing import Any, Optional
 
 import requests
@@ -24,6 +28,9 @@ RATE_LIMIT_REPLY = (
     "Please check the API key, billing, or project budget."
 )
 OPENAI_ERROR_REPLY = "I can't reply right now because the OpenAI API request failed. Please try again later."
+TELEGRAM_MESSAGE_LIMIT = 4000
+TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_FORMATTING_HEADROOM = 3500
 
 
 def utc_now_iso() -> str:
@@ -122,6 +129,137 @@ def response_incomplete_reason(response: Any) -> Optional[str]:
     return response_field(incomplete_details, "reason")
 
 
+def split_telegram_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if len(stripped) <= limit:
+        return [stripped]
+
+    chunks = []
+    remaining = stripped
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit + 1)
+        if split_at <= 0:
+            split_at = remaining.rfind(" ", 0, limit + 1)
+        if split_at <= 0:
+            split_at = limit
+
+        chunk = remaining[:split_at].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    placeholders: dict[str, str] = {}
+    placeholder_index = 0
+
+    def store(value: str) -> str:
+        nonlocal placeholder_index
+        token = f"ZZPLACEHOLDERTOKEN{placeholder_index}ZZ"
+        placeholder_index += 1
+        placeholders[token] = value
+        return token
+
+    def replace_fenced_code(match: re.Match[str]) -> str:
+        code = match.group(1).strip("\n")
+        return store(f"<pre><code>{html.escape(code)}</code></pre>")
+
+    def replace_inline_code(match: re.Match[str]) -> str:
+        return store(f"<code>{html.escape(match.group(1))}</code>")
+
+    def replace_link(match: re.Match[str]) -> str:
+        label = html.escape(match.group(1))
+        url = html.escape(match.group(2), quote=True)
+        return store(f'<a href="{url}">{label}</a>')
+
+    working = text.replace("\r\n", "\n").strip()
+    working = re.sub(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", replace_fenced_code, working, flags=re.DOTALL)
+    working = re.sub(r"`([^`\n]+)`", replace_inline_code, working)
+    working = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", replace_link, working)
+    working = html.escape(working)
+
+    formatted_lines = []
+    for line in working.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("### "):
+            content = stripped[4:].strip()
+            formatted_lines.append(f"<b>{content}</b>")
+        elif stripped.startswith("## "):
+            content = stripped[3:].strip()
+            formatted_lines.append(f"<b>{content}</b>")
+        elif stripped.startswith("# "):
+            content = stripped[2:].strip()
+            formatted_lines.append(f"<b>{content}</b>")
+        elif stripped.startswith("&gt; "):
+            content = stripped[5:].strip()
+            formatted_lines.append(f"<blockquote>{content}</blockquote>")
+        else:
+            formatted_lines.append(line)
+
+    working = "\n".join(formatted_lines)
+    working = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", working, flags=re.DOTALL)
+    working = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", working, flags=re.DOTALL)
+    working = re.sub(r"(?<!_)__(.+?)__(?!_)", r"<b>\1</b>", working, flags=re.DOTALL)
+    working = re.sub(r"(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)", r"<i>\1</i>", working, flags=re.DOTALL)
+
+    for token, value in placeholders.items():
+        working = working.replace(html.escape(token), value)
+        working = working.replace(token, value)
+
+    return working
+
+
+def html_to_plain_text(text: str) -> str:
+    without_tags = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(without_tags)
+
+
+def build_telegram_html_chunks(text: str) -> list[str]:
+    raw_chunks = split_telegram_message(text, TELEGRAM_FORMATTING_HEADROOM)
+    html_chunks = []
+
+    for raw_chunk in raw_chunks:
+        html_chunk = markdown_to_telegram_html(raw_chunk)
+        if len(html_chunk) <= TELEGRAM_MESSAGE_LIMIT:
+            html_chunks.append(html_chunk)
+            continue
+
+        # If formatting expansion still pushed us over Telegram's limit, split more aggressively.
+        smaller_raw_chunks = split_telegram_message(raw_chunk, max(500, TELEGRAM_FORMATTING_HEADROOM // 2))
+        for smaller_raw_chunk in smaller_raw_chunks:
+            smaller_html_chunk = markdown_to_telegram_html(smaller_raw_chunk)
+            if len(smaller_html_chunk) > TELEGRAM_MESSAGE_LIMIT:
+                html_chunks.append(html.escape(smaller_raw_chunk)[:TELEGRAM_MESSAGE_LIMIT])
+            else:
+                html_chunks.append(smaller_html_chunk)
+
+    return html_chunks
+
+
+def extract_response_images(response: Any) -> list[bytes]:
+    images = []
+    for item in response_field(response, "output", []) or []:
+        if response_field(item, "type") != "image_generation_call":
+            continue
+
+        encoded = response_field(item, "result")
+        if not encoded:
+            continue
+
+        try:
+            images.append(base64.b64decode(encoded))
+        except Exception:
+            LOGGER.exception("failed to decode image_generation_call result")
+
+    return images
+
+
 @dataclass
 class Settings:
     telegram_bot_token: str
@@ -130,6 +268,7 @@ class Settings:
     openai_reasoning_effort: str
     openai_text_verbosity: str
     openai_max_output_tokens: int
+    openai_enable_image_generation: bool
     sqlite_path: str
     memory_messages: int
     polling_timeout_seconds: int
@@ -152,6 +291,7 @@ class Settings:
             openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "medium").strip(),
             openai_text_verbosity=os.getenv("OPENAI_TEXT_VERBOSITY", "medium").strip(),
             openai_max_output_tokens=max(64, int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))),
+            openai_enable_image_generation=os.getenv("OPENAI_ENABLE_IMAGE_GENERATION", "false").lower() == "true",
             sqlite_path=os.getenv("SQLITE_PATH", "bot.db").strip(),
             memory_messages=max(1, int(os.getenv("MEMORY_MESSAGES", "12"))),
             polling_timeout_seconds=max(1, int(os.getenv("POLLING_TIMEOUT_SECONDS", "30"))),
@@ -275,16 +415,33 @@ class TelegramBot:
         self.running = True
         self.closed = False
 
-    def request(self, method: str, payload: Optional[dict[str, Any]] = None) -> Any:
+    def request(
+        self,
+        method: str,
+        payload: Optional[dict[str, Any]] = None,
+        files: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        request_kwargs = {
+            "timeout": (10, self.settings.polling_timeout_seconds + 20),
+        }
+        if files:
+            request_kwargs["data"] = payload or {}
+            request_kwargs["files"] = files
+        else:
+            request_kwargs["json"] = payload or {}
+
         response = self.session.post(
             f"{self.base_url}/{method}",
-            json=payload or {},
-            timeout=self.settings.polling_timeout_seconds + 10,
+            **request_kwargs,
         )
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram API error for {method}: {data}")
+        try:
+            data = response.json()
+        except ValueError:
+            response.raise_for_status()
+            raise RuntimeError(f"Telegram API returned non-JSON for {method}: {response.text}")
+
+        if response.status_code >= 400 or not data.get("ok"):
+            raise RuntimeError(f"Telegram API error for {method}: status={response.status_code} body={data}")
         return data["result"]
 
     def load_bot_identity(self) -> None:
@@ -363,7 +520,7 @@ class TelegramBot:
             {"role": "user", "content": user_prompt},
         ]
 
-    def generate_reply(self, message: dict[str, Any], memory_rows: list[sqlite3.Row]) -> str:
+    def generate_reply(self, message: dict[str, Any], memory_rows: list[sqlite3.Row]) -> tuple[str, list[bytes]]:
         request_kwargs = {
             "model": self.settings.openai_model,
             "input": self.build_prompt(message, memory_rows),
@@ -378,11 +535,14 @@ class TelegramBot:
         }
         if supports_reasoning_effort(self.settings.openai_model):
             request_kwargs["reasoning"] = {"effort": self.settings.openai_reasoning_effort}
+        if self.settings.openai_enable_image_generation:
+            request_kwargs["tools"] = [{"type": "image_generation"}]
 
         response = self.openai_client.responses.create(**request_kwargs)
         text = extract_response_text(response)
+        image_bytes_list = extract_response_images(response)
         incomplete_reason = response_incomplete_reason(response)
-        if not text and incomplete_reason == "max_output_tokens":
+        if not text and not image_bytes_list and incomplete_reason == "max_output_tokens":
             retry_max_output_tokens = min(max(self.settings.openai_max_output_tokens * 2, 2000), 4096)
             LOGGER.warning(
                 "response hit max_output_tokens during reasoning; retrying with max_output_tokens=%s",
@@ -392,44 +552,125 @@ class TelegramBot:
             retry_kwargs["max_output_tokens"] = retry_max_output_tokens
             response = self.openai_client.responses.create(**retry_kwargs)
             text = extract_response_text(response)
+            image_bytes_list = extract_response_images(response)
 
-        if not text:
+        if not text and not image_bytes_list:
             raise RuntimeError(
-                "OpenAI response did not contain text content "
+                "OpenAI response did not contain text or image content "
                 f"({summarize_response_output(response)})"
             )
-        return text
+        return text, image_bytes_list
 
-    def send_group_reply(self, chat_id: int, reply_to_message_id: int, text: str) -> dict[str, Any]:
+    def send_group_reply(
+        self,
+        chat_id: int,
+        reply_to_message_id: int,
+        text: str,
+        parse_mode: Optional[str] = "HTML",
+    ) -> dict[str, Any]:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "reply_to_message_id": reply_to_message_id,
+            "allow_sending_without_reply": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        return self.request("sendMessage", payload)
+
+    def send_group_photo(
+        self,
+        chat_id: int,
+        reply_to_message_id: int,
+        image_bytes: bytes,
+        caption: str = "",
+    ) -> dict[str, Any]:
+        file_obj = BytesIO(image_bytes)
+        file_obj.name = "openai-image.png"
+
+        payload = {
+            "chat_id": str(chat_id),
+            "reply_to_message_id": str(reply_to_message_id),
+            "allow_sending_without_reply": "true",
+        }
+        if caption:
+            payload["caption"] = caption[:TELEGRAM_CAPTION_LIMIT]
+            payload["parse_mode"] = "HTML"
+
         return self.request(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "reply_to_message_id": reply_to_message_id,
-                "allow_sending_without_reply": True,
-            },
+            "sendPhoto",
+            payload,
+            files={"photo": (file_obj.name, file_obj, "image/png")},
         )
 
-    def send_and_log_reply(self, trigger_message: dict[str, Any], reply_text: str) -> None:
-        sent_message = self.send_group_reply(
-            chat_id=trigger_message["chat"]["id"],
-            reply_to_message_id=trigger_message["message_id"],
-            text=reply_text,
-        )
-        self.store.log_message(
-            direction="outbound",
-            telegram_update_id=None,
-            telegram_message_id=sent_message["message_id"],
-            telegram_chat_id=sent_message["chat"]["id"],
-            telegram_chat_type=sent_message["chat"].get("type"),
-            telegram_user_id=(sent_message.get("from") or {}).get("id"),
-            telegram_username=(sent_message.get("from") or {}).get("username"),
-            telegram_full_name=format_sender_name(sent_message.get("from") or {}),
-            reply_to_message_id=trigger_message["message_id"],
-            message_text=reply_text,
-            raw_payload=sent_message,
-        )
+    def send_and_log_reply(
+        self,
+        trigger_message: dict[str, Any],
+        reply_text: str,
+        image_bytes_list: Optional[list[bytes]] = None,
+    ) -> None:
+        chunks = split_telegram_message(reply_text) if reply_text.strip() else []
+        images = image_bytes_list or []
+
+        if not chunks and not images:
+            raise RuntimeError("refusing to send empty Telegram reply")
+
+        formatted_chunks = build_telegram_html_chunks(reply_text) if reply_text.strip() else []
+
+        for chunk in formatted_chunks:
+            try:
+                sent_message = self.send_group_reply(
+                    chat_id=trigger_message["chat"]["id"],
+                    reply_to_message_id=trigger_message["message_id"],
+                    text=chunk,
+                    parse_mode="HTML",
+                )
+                logged_message_text = chunk
+            except RuntimeError:
+                LOGGER.exception("formatted Telegram chunk failed; retrying as plain text")
+                plain_chunk = html_to_plain_text(chunk)[:TELEGRAM_MESSAGE_LIMIT]
+                sent_message = self.send_group_reply(
+                    chat_id=trigger_message["chat"]["id"],
+                    reply_to_message_id=trigger_message["message_id"],
+                    text=plain_chunk,
+                    parse_mode=None,
+                )
+                logged_message_text = plain_chunk
+
+            self.store.log_message(
+                direction="outbound",
+                telegram_update_id=None,
+                telegram_message_id=sent_message["message_id"],
+                telegram_chat_id=sent_message["chat"]["id"],
+                telegram_chat_type=sent_message["chat"].get("type"),
+                telegram_user_id=(sent_message.get("from") or {}).get("id"),
+                telegram_username=(sent_message.get("from") or {}).get("username"),
+                telegram_full_name=format_sender_name(sent_message.get("from") or {}),
+                reply_to_message_id=trigger_message["message_id"],
+                message_text=logged_message_text,
+                raw_payload=sent_message,
+            )
+
+        for index, image_bytes in enumerate(images, start=1):
+            sent_message = self.send_group_photo(
+                chat_id=trigger_message["chat"]["id"],
+                reply_to_message_id=trigger_message["message_id"],
+                image_bytes=image_bytes,
+                caption="",
+            )
+            self.store.log_message(
+                direction="outbound",
+                telegram_update_id=None,
+                telegram_message_id=sent_message["message_id"],
+                telegram_chat_id=sent_message["chat"]["id"],
+                telegram_chat_type=sent_message["chat"].get("type"),
+                telegram_user_id=(sent_message.get("from") or {}).get("id"),
+                telegram_username=(sent_message.get("from") or {}).get("username"),
+                telegram_full_name=format_sender_name(sent_message.get("from") or {}),
+                reply_to_message_id=trigger_message["message_id"],
+                message_text=f"[image {index}/{len(images)} generated by OpenAI]",
+                raw_payload=sent_message,
+            )
 
     def process_update(self, update: dict[str, Any]) -> None:
         message = update.get("message")
@@ -470,7 +711,7 @@ class TelegramBot:
         )
 
         try:
-            reply_text = self.generate_reply(message, memory_rows)
+            reply_text, image_bytes_list = self.generate_reply(message, memory_rows)
         except RateLimitError:
             LOGGER.exception("openai rate limit or quota error for message_id=%s", message["message_id"])
             self.send_and_log_reply(message, RATE_LIMIT_REPLY)
@@ -480,7 +721,7 @@ class TelegramBot:
             self.send_and_log_reply(message, OPENAI_ERROR_REPLY)
             return
 
-        self.send_and_log_reply(message, reply_text)
+        self.send_and_log_reply(message, reply_text, image_bytes_list)
 
     def run(self) -> None:
         self.load_bot_identity()
@@ -502,6 +743,8 @@ class TelegramBot:
                         self.process_update(update)
                     except Exception:
                         LOGGER.exception("failed to process update_id=%s", update.get("update_id"))
+            except requests.ReadTimeout:
+                LOGGER.warning("telegram long poll timed out; continuing")
             except requests.RequestException:
                 LOGGER.exception("telegram polling failed; retrying")
                 time.sleep(2)
