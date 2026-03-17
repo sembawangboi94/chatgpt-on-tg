@@ -28,9 +28,19 @@ RATE_LIMIT_REPLY = (
     "Please check the API key, billing, or project budget."
 )
 OPENAI_ERROR_REPLY = "I can't reply right now because the OpenAI API request failed. Please try again later."
+OPENAI_TRUNCATION_NOTICE = (
+    "Notice: my answer may be incomplete because the model hit its output limit. "
+    "Ask me to continue if you want the rest."
+)
+OPENAI_INCOMPLETE_NOTICE = (
+    "Notice: the model returned an incomplete answer, so part of the reply may be missing."
+)
 TELEGRAM_MESSAGE_LIMIT = 4000
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_FORMATTING_HEADROOM = 3500
+TELEGRAM_SEND_RETRIES = 3
+TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1
+TELEGRAM_BETWEEN_CHUNKS_DELAY_SECONDS = 0.2
 
 
 def utc_now_iso() -> str:
@@ -120,6 +130,14 @@ def summarize_response_output(response: Any) -> str:
     if not summaries:
         return f"status={status} output=[]"
     return f"status={status} output={summaries}"
+
+
+def serialize_response(response: Any) -> dict[str, Any]:
+    if hasattr(response, "model_dump"):
+        return response.model_dump(mode="json")
+    if isinstance(response, dict):
+        return response
+    raise TypeError("response is not serializable")
 
 
 def response_incomplete_reason(response: Any) -> Optional[str]:
@@ -332,6 +350,21 @@ class SQLiteStore:
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique_inbound
             ON messages (telegram_update_id, telegram_message_id, direction);
+
+            CREATE TABLE IF NOT EXISTS openai_responses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_chat_id INTEGER NOT NULL,
+                trigger_message_id INTEGER NOT NULL,
+                attempt INTEGER NOT NULL,
+                status TEXT,
+                incomplete_reason TEXT,
+                output_text TEXT NOT NULL,
+                raw_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_openai_responses_lookup
+            ON openai_responses (telegram_chat_id, trigger_message_id, attempt);
             """
         )
         self.conn.commit()
@@ -400,8 +433,53 @@ class SQLiteStore:
         rows.reverse()
         return rows
 
+    def log_openai_response(
+        self,
+        *,
+        telegram_chat_id: int,
+        trigger_message_id: int,
+        attempt: int,
+        status: Optional[str],
+        incomplete_reason: Optional[str],
+        output_text: str,
+        raw_payload: dict[str, Any],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO openai_responses (
+                telegram_chat_id,
+                trigger_message_id,
+                attempt,
+                status,
+                incomplete_reason,
+                output_text,
+                raw_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_chat_id,
+                trigger_message_id,
+                attempt,
+                status,
+                incomplete_reason,
+                output_text,
+                json.dumps(raw_payload, ensure_ascii=True, separators=(",", ":")),
+                utc_now_iso(),
+            ),
+        )
+        self.conn.commit()
+
     def close(self) -> None:
         self.conn.close()
+
+
+class TelegramAPIError(RuntimeError):
+    def __init__(self, method: str, status_code: int, body: Any):
+        super().__init__(f"Telegram API error for {method}: status={status_code} body={body}")
+        self.method = method
+        self.status_code = status_code
+        self.body = body
 
 
 class TelegramBot:
@@ -441,8 +519,50 @@ class TelegramBot:
             raise RuntimeError(f"Telegram API returned non-JSON for {method}: {response.text}")
 
         if response.status_code >= 400 or not data.get("ok"):
-            raise RuntimeError(f"Telegram API error for {method}: status={response.status_code} body={data}")
+            raise TelegramAPIError(method, response.status_code, data)
         return data["result"]
+
+    def request_with_retries(
+        self,
+        method: str,
+        payload: Optional[dict[str, Any]] = None,
+        files: Optional[dict[str, Any]] = None,
+        retries: int = TELEGRAM_SEND_RETRIES,
+    ) -> Any:
+        last_error: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                return self.request(method, payload, files)
+            except (requests.ConnectionError, requests.ReadTimeout) as exc:
+                last_error = exc
+                if attempt == retries:
+                    break
+                LOGGER.warning(
+                    "telegram %s failed on attempt %s/%s; retrying",
+                    method,
+                    attempt,
+                    retries,
+                )
+                time.sleep(TELEGRAM_SEND_RETRY_DELAY_SECONDS)
+            except TelegramAPIError as exc:
+                last_error = exc
+                parameters = exc.body.get("parameters") if isinstance(exc.body, dict) else None
+                retry_after = parameters.get("retry_after") if isinstance(parameters, dict) else None
+                if exc.status_code == 429 and retry_after is not None and attempt < retries:
+                    LOGGER.warning(
+                        "telegram %s hit rate limit on attempt %s/%s; retrying in %ss",
+                        method,
+                        attempt,
+                        retries,
+                        retry_after,
+                    )
+                    time.sleep(retry_after)
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"telegram request failed without an exception for {method}")
 
     def load_bot_identity(self) -> None:
         self.bot_user = self.request("getMe")
@@ -520,7 +640,11 @@ class TelegramBot:
             {"role": "user", "content": user_prompt},
         ]
 
-    def generate_reply(self, message: dict[str, Any], memory_rows: list[sqlite3.Row]) -> tuple[str, list[bytes]]:
+    def generate_reply(
+        self,
+        message: dict[str, Any],
+        memory_rows: list[sqlite3.Row],
+    ) -> tuple[str, list[bytes], list[str]]:
         request_kwargs = {
             "model": self.settings.openai_model,
             "input": self.build_prompt(message, memory_rows),
@@ -538,11 +662,22 @@ class TelegramBot:
         if self.settings.openai_enable_image_generation:
             request_kwargs["tools"] = [{"type": "image_generation"}]
 
+        notices: list[str] = []
         response = self.openai_client.responses.create(**request_kwargs)
         text = extract_response_text(response)
         image_bytes_list = extract_response_images(response)
         incomplete_reason = response_incomplete_reason(response)
-        if not text and not image_bytes_list and incomplete_reason == "max_output_tokens":
+        self.store.log_openai_response(
+            telegram_chat_id=message["chat"]["id"],
+            trigger_message_id=message["message_id"],
+            attempt=1,
+            status=response_field(response, "status"),
+            incomplete_reason=incomplete_reason,
+            output_text=text,
+            raw_payload=serialize_response(response),
+        )
+
+        if incomplete_reason == "max_output_tokens":
             retry_max_output_tokens = min(max(self.settings.openai_max_output_tokens * 2, 2000), 4096)
             LOGGER.warning(
                 "response hit max_output_tokens during reasoning; retrying with max_output_tokens=%s",
@@ -550,16 +685,37 @@ class TelegramBot:
             )
             retry_kwargs = dict(request_kwargs)
             retry_kwargs["max_output_tokens"] = retry_max_output_tokens
-            response = self.openai_client.responses.create(**retry_kwargs)
-            text = extract_response_text(response)
-            image_bytes_list = extract_response_images(response)
+            retry_response = self.openai_client.responses.create(**retry_kwargs)
+            retry_text = extract_response_text(retry_response)
+            retry_image_bytes_list = extract_response_images(retry_response)
+            retry_incomplete_reason = response_incomplete_reason(retry_response)
+            self.store.log_openai_response(
+                telegram_chat_id=message["chat"]["id"],
+                trigger_message_id=message["message_id"],
+                attempt=2,
+                status=response_field(retry_response, "status"),
+                incomplete_reason=retry_incomplete_reason,
+                output_text=retry_text,
+                raw_payload=serialize_response(retry_response),
+            )
+
+            if len(retry_text) >= len(text) or (retry_image_bytes_list and not image_bytes_list):
+                response = retry_response
+                text = retry_text
+                image_bytes_list = retry_image_bytes_list
+                incomplete_reason = retry_incomplete_reason
+
+        if incomplete_reason == "max_output_tokens":
+            notices.append(OPENAI_TRUNCATION_NOTICE)
+        elif response_field(response, "status") == "incomplete":
+            notices.append(OPENAI_INCOMPLETE_NOTICE)
 
         if not text and not image_bytes_list:
             raise RuntimeError(
                 "OpenAI response did not contain text or image content "
                 f"({summarize_response_output(response)})"
             )
-        return text, image_bytes_list
+        return text, image_bytes_list, notices
 
     def send_group_reply(
         self,
@@ -576,7 +732,7 @@ class TelegramBot:
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
-        return self.request("sendMessage", payload)
+        return self.request_with_retries("sendMessage", payload)
 
     def send_group_photo(
         self,
@@ -597,27 +753,75 @@ class TelegramBot:
             payload["caption"] = caption[:TELEGRAM_CAPTION_LIMIT]
             payload["parse_mode"] = "HTML"
 
-        return self.request(
+        return self.request_with_retries(
             "sendPhoto",
             payload,
             files={"photo": (file_obj.name, file_obj, "image/png")},
         )
+
+    def log_outbound_telegram_message(
+        self,
+        *,
+        trigger_message: dict[str, Any],
+        sent_message: dict[str, Any],
+        message_text: str,
+    ) -> None:
+        self.store.log_message(
+            direction="outbound",
+            telegram_update_id=None,
+            telegram_message_id=sent_message["message_id"],
+            telegram_chat_id=sent_message["chat"]["id"],
+            telegram_chat_type=sent_message["chat"].get("type"),
+            telegram_user_id=(sent_message.get("from") or {}).get("id"),
+            telegram_username=(sent_message.get("from") or {}).get("username"),
+            telegram_full_name=format_sender_name(sent_message.get("from") or {}),
+            reply_to_message_id=trigger_message["message_id"],
+            message_text=message_text,
+            raw_payload=sent_message,
+        )
+
+    def send_status_notice(self, trigger_message: dict[str, Any], notice_text: str) -> None:
+        try:
+            sent_message = self.send_group_reply(
+                chat_id=trigger_message["chat"]["id"],
+                reply_to_message_id=trigger_message["message_id"],
+                text=notice_text[:TELEGRAM_MESSAGE_LIMIT],
+                parse_mode=None,
+            )
+            self.log_outbound_telegram_message(
+                trigger_message=trigger_message,
+                sent_message=sent_message,
+                message_text=f"[notice] {notice_text}",
+            )
+        except Exception:
+            LOGGER.exception(
+                "failed to send Telegram status notice for trigger_message_id=%s",
+                trigger_message["message_id"],
+            )
 
     def send_and_log_reply(
         self,
         trigger_message: dict[str, Any],
         reply_text: str,
         image_bytes_list: Optional[list[bytes]] = None,
+        notices: Optional[list[str]] = None,
     ) -> None:
         chunks = split_telegram_message(reply_text) if reply_text.strip() else []
         images = image_bytes_list or []
+        pending_notices = list(notices or [])
 
         if not chunks and not images:
             raise RuntimeError("refusing to send empty Telegram reply")
 
         formatted_chunks = build_telegram_html_chunks(reply_text) if reply_text.strip() else []
+        LOGGER.info(
+            "sending outbound reply message_id=%s text_chunks=%s images=%s",
+            trigger_message["message_id"],
+            len(formatted_chunks),
+            len(images),
+        )
 
-        for chunk in formatted_chunks:
+        for index, chunk in enumerate(formatted_chunks, start=1):
             try:
                 sent_message = self.send_group_reply(
                     chat_id=trigger_message["chat"]["id"],
@@ -626,51 +830,89 @@ class TelegramBot:
                     parse_mode="HTML",
                 )
                 logged_message_text = chunk
-            except RuntimeError:
-                LOGGER.exception("formatted Telegram chunk failed; retrying as plain text")
-                plain_chunk = html_to_plain_text(chunk)[:TELEGRAM_MESSAGE_LIMIT]
-                sent_message = self.send_group_reply(
-                    chat_id=trigger_message["chat"]["id"],
-                    reply_to_message_id=trigger_message["message_id"],
-                    text=plain_chunk,
-                    parse_mode=None,
+            except Exception:
+                LOGGER.exception(
+                    "formatted Telegram chunk %s/%s failed; retrying as plain text",
+                    index,
+                    len(formatted_chunks),
                 )
-                logged_message_text = plain_chunk
+                try:
+                    plain_chunk = html_to_plain_text(chunk)[:TELEGRAM_MESSAGE_LIMIT]
+                    sent_message = self.send_group_reply(
+                        chat_id=trigger_message["chat"]["id"],
+                        reply_to_message_id=trigger_message["message_id"],
+                        text=plain_chunk,
+                        parse_mode=None,
+                    )
+                    logged_message_text = plain_chunk
+                except Exception:
+                    LOGGER.exception(
+                        "telegram text chunk %s/%s failed after plain-text fallback",
+                        index,
+                        len(formatted_chunks),
+                    )
+                    self.send_status_notice(
+                        trigger_message,
+                        (
+                            f"Notice: I could not deliver the full reply to Telegram. "
+                            f"I sent {index - 1} of {len(formatted_chunks)} text chunk(s)."
+                        ),
+                    )
+                    return
 
-            self.store.log_message(
-                direction="outbound",
-                telegram_update_id=None,
-                telegram_message_id=sent_message["message_id"],
-                telegram_chat_id=sent_message["chat"]["id"],
-                telegram_chat_type=sent_message["chat"].get("type"),
-                telegram_user_id=(sent_message.get("from") or {}).get("id"),
-                telegram_username=(sent_message.get("from") or {}).get("username"),
-                telegram_full_name=format_sender_name(sent_message.get("from") or {}),
-                reply_to_message_id=trigger_message["message_id"],
+            self.log_outbound_telegram_message(
+                trigger_message=trigger_message,
+                sent_message=sent_message,
                 message_text=logged_message_text,
-                raw_payload=sent_message,
             )
+            LOGGER.info(
+                "sent Telegram text chunk %s/%s for trigger_message_id=%s",
+                index,
+                len(formatted_chunks),
+                trigger_message["message_id"],
+            )
+            if index < len(formatted_chunks) or images:
+                time.sleep(TELEGRAM_BETWEEN_CHUNKS_DELAY_SECONDS)
 
         for index, image_bytes in enumerate(images, start=1):
-            sent_message = self.send_group_photo(
-                chat_id=trigger_message["chat"]["id"],
-                reply_to_message_id=trigger_message["message_id"],
-                image_bytes=image_bytes,
-                caption="",
-            )
-            self.store.log_message(
-                direction="outbound",
-                telegram_update_id=None,
-                telegram_message_id=sent_message["message_id"],
-                telegram_chat_id=sent_message["chat"]["id"],
-                telegram_chat_type=sent_message["chat"].get("type"),
-                telegram_user_id=(sent_message.get("from") or {}).get("id"),
-                telegram_username=(sent_message.get("from") or {}).get("username"),
-                telegram_full_name=format_sender_name(sent_message.get("from") or {}),
-                reply_to_message_id=trigger_message["message_id"],
+            try:
+                sent_message = self.send_group_photo(
+                    chat_id=trigger_message["chat"]["id"],
+                    reply_to_message_id=trigger_message["message_id"],
+                    image_bytes=image_bytes,
+                    caption="",
+                )
+            except Exception:
+                LOGGER.exception(
+                    "telegram image %s/%s failed to send",
+                    index,
+                    len(images),
+                )
+                self.send_status_notice(
+                    trigger_message,
+                    (
+                        f"Notice: I could not deliver all generated images to Telegram. "
+                        f"I sent {index - 1} of {len(images)} image(s)."
+                    ),
+                )
+                return
+            self.log_outbound_telegram_message(
+                trigger_message=trigger_message,
+                sent_message=sent_message,
                 message_text=f"[image {index}/{len(images)} generated by OpenAI]",
-                raw_payload=sent_message,
             )
+            LOGGER.info(
+                "sent Telegram image %s/%s for trigger_message_id=%s",
+                index,
+                len(images),
+                trigger_message["message_id"],
+            )
+            if index < len(images):
+                time.sleep(TELEGRAM_BETWEEN_CHUNKS_DELAY_SECONDS)
+
+        for notice_text in pending_notices:
+            self.send_status_notice(trigger_message, notice_text)
+            time.sleep(TELEGRAM_BETWEEN_CHUNKS_DELAY_SECONDS)
 
     def process_update(self, update: dict[str, Any]) -> None:
         message = update.get("message")
@@ -711,7 +953,7 @@ class TelegramBot:
         )
 
         try:
-            reply_text, image_bytes_list = self.generate_reply(message, memory_rows)
+            reply_text, image_bytes_list, notices = self.generate_reply(message, memory_rows)
         except RateLimitError:
             LOGGER.exception("openai rate limit or quota error for message_id=%s", message["message_id"])
             self.send_and_log_reply(message, RATE_LIMIT_REPLY)
@@ -721,7 +963,7 @@ class TelegramBot:
             self.send_and_log_reply(message, OPENAI_ERROR_REPLY)
             return
 
-        self.send_and_log_reply(message, reply_text, image_bytes_list)
+        self.send_and_log_reply(message, reply_text, image_bytes_list, notices)
 
     def run(self) -> None:
         self.load_bot_identity()
