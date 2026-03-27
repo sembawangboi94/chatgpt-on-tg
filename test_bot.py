@@ -2,6 +2,7 @@ import base64
 import os
 import tempfile
 import unittest
+from html.parser import HTMLParser
 
 import requests
 
@@ -12,6 +13,41 @@ from bot import (
     TelegramBot,
     markdown_to_telegram_html,
 )
+
+
+class TelegramHTMLValidator(HTMLParser):
+    allowed_tags = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre", "blockquote"}
+
+    def __init__(self):
+        super().__init__()
+        self.stack = []
+        self.errors = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in self.allowed_tags:
+            self.errors.append(f"unsupported tag <{tag}>")
+            return
+        if tag == "a":
+            attr_names = {name for name, _ in attrs}
+            if "href" not in attr_names:
+                self.errors.append("anchor tag missing href")
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if tag not in self.allowed_tags:
+            self.errors.append(f"unsupported closing tag </{tag}>")
+            return
+        if not self.stack:
+            self.errors.append(f"closing tag </{tag}> without opener")
+            return
+        opened = self.stack.pop()
+        if opened != tag:
+            self.errors.append(f"mismatched closing tag </{tag}> for <{opened}>")
+
+    def close(self):
+        super().close()
+        if self.stack:
+            self.errors.append(f"unclosed tags: {self.stack}")
 
 
 class FakeResponsesAPI:
@@ -140,6 +176,44 @@ class BotTestCase(unittest.TestCase):
         self.assertIn("<i>italic</i>", rendered)
         self.assertIn("<code>code</code>", rendered)
         self.assertIn('<a href="https://example.com">link</a>', rendered)
+
+    def assert_valid_telegram_html(self, rendered):
+        validator = TelegramHTMLValidator()
+        validator.feed(rendered)
+        validator.close()
+        self.assertEqual(validator.errors, [], msg=f"invalid telegram html: {validator.errors}\n{rendered}")
+
+    def test_markdown_to_telegram_html_validates_telegram_safe_html(self):
+        cases = [
+            "# Heading\n\n**bold** and *italic* and `code`",
+            "```\nfor i in range(3):\n    print(i)\n```",
+            "> quoted text\n\nNormal paragraph with [link](https://example.com).",
+            "Raw <b>html</b> should be escaped, not emitted as a real tag.",
+            "Mixed **bold and `code`** with _italic_ and literal <angle brackets>.",
+        ]
+
+        for case in cases:
+            with self.subTest(case=case):
+                rendered = markdown_to_telegram_html(case)
+                self.assert_valid_telegram_html(rendered)
+                self.assertNotIn("<script", rendered.lower())
+
+    def test_markdown_to_telegram_html_escapes_raw_html(self):
+        rendered = markdown_to_telegram_html("Literal <b>tag</b> and <unsafe>")
+        self.assertIn("&lt;unsafe&gt;", rendered)
+        self.assertIn("<b>tag</b>", rendered)
+        self.assert_valid_telegram_html(rendered)
+
+    def test_markdown_to_telegram_html_preserves_safe_html_tags_from_model(self):
+        rendered = markdown_to_telegram_html(
+            "<b>5.3 What kind of events would really matter?</b>\n"
+            "That <i>would</i> be big.\n"
+            '<a href="https://example.com">source</a>'
+        )
+        self.assertIn("<b>5.3 What kind of events would really matter?</b>", rendered)
+        self.assertIn("<i>would</i>", rendered)
+        self.assertIn('<a href="https://example.com">source</a>', rendered)
+        self.assert_valid_telegram_html(rendered)
 
     def test_process_update_sends_formatted_text_reply(self):
         response = {

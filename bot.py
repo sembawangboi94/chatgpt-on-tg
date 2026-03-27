@@ -176,6 +176,32 @@ def split_telegram_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> li
 def markdown_to_telegram_html(text: str) -> str:
     placeholders: dict[str, str] = {}
     placeholder_index = 0
+    safe_tags = {
+        "b",
+        "/b",
+        "strong",
+        "/strong",
+        "i",
+        "/i",
+        "em",
+        "/em",
+        "u",
+        "/u",
+        "ins",
+        "/ins",
+        "s",
+        "/s",
+        "strike",
+        "/strike",
+        "del",
+        "/del",
+        "code",
+        "/code",
+        "pre",
+        "/pre",
+        "blockquote",
+        "/blockquote",
+    }
 
     def store(value: str) -> str:
         nonlocal placeholder_index
@@ -183,6 +209,18 @@ def markdown_to_telegram_html(text: str) -> str:
         placeholder_index += 1
         placeholders[token] = value
         return token
+
+    def replace_safe_html_tag(match: re.Match[str]) -> str:
+        raw_tag = match.group(0)
+        normalized = match.group(1).strip().lower()
+        if normalized in safe_tags:
+            return store(raw_tag)
+        return raw_tag
+
+    def replace_safe_anchor_tag(match: re.Match[str]) -> str:
+        href = html.escape(match.group(1), quote=True)
+        label = html.escape(match.group(2))
+        return store(f'<a href="{href}">{label}</a>')
 
     def replace_fenced_code(match: re.Match[str]) -> str:
         code = match.group(1).strip("\n")
@@ -197,6 +235,8 @@ def markdown_to_telegram_html(text: str) -> str:
         return store(f'<a href="{url}">{label}</a>')
 
     working = text.replace("\r\n", "\n").strip()
+    working = re.sub(r'<a\s+href="(https?://[^"]+)">(.+?)</a>', replace_safe_anchor_tag, working, flags=re.IGNORECASE | re.DOTALL)
+    working = re.sub(r"<\s*(/??\s*[a-zA-Z0-9]+)\s*>", replace_safe_html_tag, working)
     working = re.sub(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", replace_fenced_code, working, flags=re.DOTALL)
     working = re.sub(r"`([^`\n]+)`", replace_inline_code, working)
     working = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", replace_link, working)
