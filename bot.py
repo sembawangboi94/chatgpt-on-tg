@@ -10,6 +10,7 @@ import html
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from io import BytesIO
 from typing import Any, Optional
 
@@ -35,12 +36,19 @@ OPENAI_TRUNCATION_NOTICE = (
 OPENAI_INCOMPLETE_NOTICE = (
     "Notice: the model returned an incomplete answer, so part of the reply may be missing."
 )
+ACKNOWLEDGEMENT_NOTICE = "I received your message and I'm working on a reply."
+PROCESSING_ERROR_NOTICE = (
+    "Notice: I received your message, but I hit an error while generating or sending the reply."
+)
 TELEGRAM_MESSAGE_LIMIT = 4000
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_FORMATTING_HEADROOM = 3500
 TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1
 TELEGRAM_BETWEEN_CHUNKS_DELAY_SECONDS = 0.2
+LINK_FETCH_TIMEOUT_SECONDS = 15
+LINK_CONTEXT_CHAR_LIMIT = 12000
+LINK_COUNT_LIMIT = 2
 
 
 def utc_now_iso() -> str:
@@ -171,6 +179,61 @@ def split_telegram_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> li
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def extract_urls(text: str, limit: int = LINK_COUNT_LIMIT) -> list[str]:
+    urls = []
+    for match in re.finditer(r"https?://\S+", text):
+        url = match.group(0).rstrip(").,!?]>}\"'")
+        urls.append(url)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+class ArticleHTMLExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_title = False
+        self.skip_depth = 0
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        lowered = tag.lower()
+        if lowered == "title":
+            self.in_title = True
+        if lowered in {"script", "style", "noscript"}:
+            self.skip_depth += 1
+        if lowered in {"p", "div", "br", "li", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.text_parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        if lowered == "title":
+            self.in_title = False
+        if lowered in {"script", "style", "noscript"} and self.skip_depth > 0:
+            self.skip_depth -= 1
+        if lowered in {"p", "div", "li", "section", "article"}:
+            self.text_parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth > 0:
+            return
+        cleaned = data.strip()
+        if not cleaned:
+            return
+        if self.in_title:
+            self.title_parts.append(cleaned)
+        self.text_parts.append(cleaned)
+
+    def extract(self) -> tuple[str, str]:
+        title = " ".join(self.title_parts).strip()
+        body = " ".join(self.text_parts)
+        body = re.sub(r"\s*\n\s*", "\n", body)
+        body = re.sub(r"\n{3,}", "\n\n", body)
+        body = re.sub(r"[ \t]{2,}", " ", body)
+        return title, body.strip()
 
 
 def markdown_to_telegram_html(text: str) -> str:
@@ -533,6 +596,52 @@ class TelegramBot:
         self.running = True
         self.closed = False
 
+    def fetch_url_context(self, url: str) -> Optional[str]:
+        response = requests.get(
+            url,
+            timeout=LINK_FETCH_TIMEOUT_SECONDS,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; TelegramOpenAIBot/1.0; +https://api.telegram.org)"
+            },
+        )
+        response.raise_for_status()
+
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "text/html" not in content_type and "text/plain" not in content_type:
+            raise RuntimeError(f"unsupported content type for link fetch: {content_type}")
+
+        if "text/plain" in content_type:
+            text = response.text.strip()
+            if not text:
+                raise RuntimeError("link fetch returned empty text/plain body")
+            return text[:LINK_CONTEXT_CHAR_LIMIT]
+
+        extractor = ArticleHTMLExtractor()
+        extractor.feed(response.text)
+        title, body = extractor.extract()
+        if not body:
+            raise RuntimeError("link fetch returned no readable article text")
+
+        if title and title not in body[: len(title) + 20]:
+            combined = f"Title: {title}\n\n{body}"
+        else:
+            combined = body
+        return combined[:LINK_CONTEXT_CHAR_LIMIT]
+
+    def fetch_link_contexts(self, text: str) -> tuple[list[str], list[str]]:
+        contexts = []
+        failed_urls = []
+        for url in extract_urls(text):
+            try:
+                context = self.fetch_url_context(url)
+            except Exception:
+                LOGGER.exception("failed to fetch url context url=%s", url)
+                failed_urls.append(url)
+                continue
+            if context:
+                contexts.append(f"URL: {url}\n{context}")
+        return contexts, failed_urls
+
     def request(
         self,
         method: str,
@@ -651,6 +760,7 @@ class TelegramBot:
         self,
         message: dict[str, Any],
         memory_rows: list[sqlite3.Row],
+        fetched_link_contexts: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
         chat = message["chat"]
         text = extract_message_text(message)
@@ -668,6 +778,7 @@ class TelegramBot:
             "Use the recent chat memory when it is relevant, but do not claim to remember anything not shown."
         )
         memory_block = "\n".join(memory_lines) if memory_lines else "(no prior chat memory)"
+        link_block = "\n\n---\n\n".join(fetched_link_contexts or [])
         user_prompt = (
             f"Telegram chat id: {chat['id']}\n"
             f"Telegram chat title: {chat.get('title', '')}\n"
@@ -675,6 +786,8 @@ class TelegramBot:
             f"Current message: {text}\n\n"
             f"Recent rolling memory from SQLite log:\n{memory_block}"
         )
+        if link_block:
+            user_prompt += f"\n\nFetched URL content for this message:\n{link_block}"
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -684,10 +797,11 @@ class TelegramBot:
         self,
         message: dict[str, Any],
         memory_rows: list[sqlite3.Row],
+        fetched_link_contexts: Optional[list[str]] = None,
     ) -> tuple[str, list[bytes], list[str]]:
         request_kwargs = {
             "model": self.settings.openai_model,
-            "input": self.build_prompt(message, memory_rows),
+            "input": self.build_prompt(message, memory_rows, fetched_link_contexts),
             "text": {
                 "format": {"type": "text"},
                 "verbosity": supported_verbosity(
@@ -967,6 +1081,7 @@ class TelegramBot:
             message["chat"]["id"],
             self.settings.memory_messages,
         )
+        fetched_link_contexts, failed_urls = self.fetch_link_contexts(text)
 
         self.store.log_message(
             direction="inbound",
@@ -985,6 +1100,8 @@ class TelegramBot:
         if not self.should_process_message(message):
             return
 
+        self.send_status_notice(message, ACKNOWLEDGEMENT_NOTICE)
+
         LOGGER.info(
             "processing chat_id=%s message_id=%s from=%s",
             message["chat"]["id"],
@@ -993,7 +1110,11 @@ class TelegramBot:
         )
 
         try:
-            reply_text, image_bytes_list, notices = self.generate_reply(message, memory_rows)
+            reply_text, image_bytes_list, notices = self.generate_reply(
+                message,
+                memory_rows,
+                fetched_link_contexts,
+            )
         except RateLimitError:
             LOGGER.exception("openai rate limit or quota error for message_id=%s", message["message_id"])
             self.send_and_log_reply(message, RATE_LIMIT_REPLY)
@@ -1002,8 +1123,21 @@ class TelegramBot:
             LOGGER.exception("openai api error for message_id=%s", message["message_id"])
             self.send_and_log_reply(message, OPENAI_ERROR_REPLY)
             return
+        except Exception:
+            LOGGER.exception("unexpected generation error for message_id=%s", message["message_id"])
+            self.send_status_notice(message, PROCESSING_ERROR_NOTICE)
+            return
 
-        self.send_and_log_reply(message, reply_text, image_bytes_list, notices)
+        if failed_urls:
+            notices = list(notices)
+            notices.append(
+                "Notice: I could not fetch some pasted links, so I answered without their full contents."
+            )
+        try:
+            self.send_and_log_reply(message, reply_text, image_bytes_list, notices)
+        except Exception:
+            LOGGER.exception("unexpected delivery error for message_id=%s", message["message_id"])
+            self.send_status_notice(message, PROCESSING_ERROR_NOTICE)
 
     def run(self) -> None:
         self.load_bot_identity()

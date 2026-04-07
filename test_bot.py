@@ -73,6 +73,8 @@ class RecordingTelegramBot(TelegramBot):
         self.openai_client = FakeOpenAIClient(openai_responses)
         self.sent_requests = []
         self.bot_user = {"id": 999, "username": "chatgpt_on_tg_bot", "first_name": "ChatGPT"}
+        self.url_contexts = {}
+        self.failed_url_contexts = set()
 
     def request(self, method, payload=None, files=None):
         self.sent_requests.append({"method": method, "payload": payload, "files": files})
@@ -92,6 +94,11 @@ class RecordingTelegramBot(TelegramBot):
             }
 
         raise AssertionError(f"unexpected Telegram method {method}")
+
+    def fetch_url_context(self, url):
+        if url in self.failed_url_contexts:
+            raise RuntimeError("simulated fetch failure")
+        return self.url_contexts.get(url)
 
 
 class RetryRecordingTelegramBot(RecordingTelegramBot):
@@ -132,9 +139,30 @@ class PartialFailureRecordingTelegramBot(RecordingTelegramBot):
     def request(self, method, payload=None, files=None):
         if method == "sendMessage":
             self.send_message_call_index += 1
-            if self.send_message_call_index in {2, 3, 4, 5, 6, 7}:
+            if self.send_message_call_index in {3, 4, 5, 6, 7, 8}:
                 raise requests.ConnectionError("simulated persistent send failure")
         return super().request(method, payload, files)
+
+
+class FailingResponsesAPI:
+    def __init__(self, error):
+        self.error = error
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        raise self.error
+
+
+class FailingOpenAIClient:
+    def __init__(self, error):
+        self.responses = FailingResponsesAPI(error)
+
+
+class GenerationFailureTelegramBot(RecordingTelegramBot):
+    def __init__(self, settings, store, error):
+        super().__init__(settings, store, [])
+        self.openai_client = FailingOpenAIClient(error)
 
 
 class BotTestCase(unittest.TestCase):
@@ -235,8 +263,9 @@ class BotTestCase(unittest.TestCase):
 
         bot.process_update(self.make_update("@chatgpt_on_tg_bot hi"))
 
-        self.assertEqual(len(bot.sent_requests), 1)
-        request = bot.sent_requests[0]
+        self.assertEqual(len(bot.sent_requests), 2)
+        self.assertIn("working on a reply", bot.sent_requests[0]["payload"]["text"])
+        request = bot.sent_requests[1]
         self.assertEqual(request["method"], "sendMessage")
         self.assertEqual(request["payload"]["parse_mode"], "HTML")
         self.assertIn("<b>Hello</b>", request["payload"]["text"])
@@ -246,7 +275,56 @@ class BotTestCase(unittest.TestCase):
         rows = store.conn.execute(
             "SELECT direction, message_text FROM messages ORDER BY id ASC"
         ).fetchall()
-        self.assertEqual([row["direction"] for row in rows], ["inbound", "outbound"])
+        self.assertEqual([row["direction"] for row in rows], ["inbound", "outbound", "outbound"])
+        self.assertIn("working on a reply", rows[1]["message_text"])
+
+    def test_build_prompt_includes_fetched_link_content(self):
+        response = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "summary"}
+                    ],
+                }
+            ]
+        }
+        store = SQLiteStore(self.db_path)
+        bot = RecordingTelegramBot(self.settings, store, [response])
+        self.addCleanup(bot.close)
+        url = "https://example.com/article"
+        bot.url_contexts[url] = "Title: Example Article\n\nThis is the fetched article body."
+
+        bot.process_update(self.make_update(f"@chatgpt_on_tg_bot summarize {url}"))
+
+        openai_call = bot.openai_client.responses.calls[0]
+        user_prompt = openai_call["input"][1]["content"]
+        self.assertIn("Fetched URL content for this message:", user_prompt)
+        self.assertIn("This is the fetched article body.", user_prompt)
+        self.assertIn(url, user_prompt)
+
+    def test_process_update_sends_notice_when_link_fetch_fails(self):
+        response = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "I could not fetch it, but here is a general answer."}
+                    ],
+                }
+            ]
+        }
+        store = SQLiteStore(self.db_path)
+        bot = RecordingTelegramBot(self.settings, store, [response])
+        self.addCleanup(bot.close)
+        url = "https://example.com/fail"
+        bot.failed_url_contexts.add(url)
+
+        bot.process_update(self.make_update(f"@chatgpt_on_tg_bot summarize {url}"))
+
+        self.assertEqual([item["method"] for item in bot.sent_requests], ["sendMessage", "sendMessage", "sendMessage"])
+        self.assertIn("working on a reply", bot.sent_requests[0]["payload"]["text"])
+        self.assertIn("could not fetch some pasted links", bot.sent_requests[2]["payload"]["text"])
 
     def test_process_update_sends_text_and_photo_reply(self):
         image_data = base64.b64encode(b"fake-image-bytes").decode("ascii")
@@ -273,9 +351,9 @@ class BotTestCase(unittest.TestCase):
 
         bot.process_update(self.make_update("@chatgpt_on_tg_bot show me"))
 
-        self.assertEqual([item["method"] for item in bot.sent_requests], ["sendMessage", "sendPhoto"])
-        send_message_request = bot.sent_requests[0]
-        send_photo_request = bot.sent_requests[1]
+        self.assertEqual([item["method"] for item in bot.sent_requests], ["sendMessage", "sendMessage", "sendPhoto"])
+        send_message_request = bot.sent_requests[1]
+        send_photo_request = bot.sent_requests[2]
         self.assertEqual(send_message_request["payload"]["text"], "Here is the image summary.")
         self.assertIsNotNone(send_photo_request["files"])
         self.assertIn("photo", send_photo_request["files"])
@@ -286,8 +364,9 @@ class BotTestCase(unittest.TestCase):
         rows = store.conn.execute(
             "SELECT direction, message_text FROM messages ORDER BY id ASC"
         ).fetchall()
-        self.assertEqual([row["direction"] for row in rows], ["inbound", "outbound", "outbound"])
-        self.assertEqual(rows[2]["message_text"], "[image 1/1 generated by OpenAI]")
+        self.assertEqual([row["direction"] for row in rows], ["inbound", "outbound", "outbound", "outbound"])
+        self.assertIn("working on a reply", rows[1]["message_text"])
+        self.assertEqual(rows[3]["message_text"], "[image 1/1 generated by OpenAI]")
 
     def test_process_update_sends_all_long_reply_chunks(self):
         paragraph = "**Heading** " + ("word " * 500)
@@ -312,8 +391,9 @@ class BotTestCase(unittest.TestCase):
         bot.process_update(self.make_update("@chatgpt_on_tg_bot give me a long answer"))
 
         message_requests = [item for item in bot.sent_requests if item["method"] == "sendMessage"]
-        self.assertGreaterEqual(len(message_requests), 3)
-        for request in message_requests:
+        self.assertGreaterEqual(len(message_requests), 4)
+        self.assertIn("working on a reply", message_requests[0]["payload"]["text"])
+        for request in message_requests[1:]:
             self.assertLessEqual(len(request["payload"]["text"]), 4000)
 
         rows = store.conn.execute(
@@ -341,14 +421,14 @@ class BotTestCase(unittest.TestCase):
 
         bot.process_update(self.make_update("@chatgpt_on_tg_bot retry this"))
 
-        self.assertEqual(len(bot.sent_requests), 1)
-        self.assertEqual(bot.sent_requests[0]["method"], "sendMessage")
+        self.assertEqual(len(bot.sent_requests), 2)
+        self.assertEqual(bot.sent_requests[1]["method"], "sendMessage")
 
         rows = store.conn.execute(
             "SELECT direction, message_text FROM messages ORDER BY id ASC"
         ).fetchall()
-        self.assertEqual([row["direction"] for row in rows], ["inbound", "outbound"])
-        self.assertIn("retry please", rows[1]["message_text"])
+        self.assertEqual([row["direction"] for row in rows], ["inbound", "outbound", "outbound"])
+        self.assertIn("retry please", rows[2]["message_text"])
 
     def test_process_update_retries_telegram_rate_limit(self):
         response = {
@@ -370,14 +450,14 @@ class BotTestCase(unittest.TestCase):
 
         bot.process_update(self.make_update("@chatgpt_on_tg_bot retry rate limit"))
 
-        self.assertEqual(len(bot.sent_requests), 1)
-        self.assertEqual(bot.sent_requests[0]["method"], "sendMessage")
+        self.assertEqual(len(bot.sent_requests), 2)
+        self.assertEqual(bot.sent_requests[1]["method"], "sendMessage")
 
         rows = store.conn.execute(
             "SELECT direction, message_text FROM messages ORDER BY id ASC"
         ).fetchall()
-        self.assertEqual([row["direction"] for row in rows], ["inbound", "outbound"])
-        self.assertIn("rate limit retry please", rows[1]["message_text"])
+        self.assertEqual([row["direction"] for row in rows], ["inbound", "outbound", "outbound"])
+        self.assertIn("rate limit retry please", rows[2]["message_text"])
 
     def test_generate_reply_retries_when_partial_text_hits_max_output_tokens(self):
         first_response = {
@@ -469,9 +549,10 @@ class BotTestCase(unittest.TestCase):
 
         bot.process_update(self.make_update("@chatgpt_on_tg_bot big answer"))
 
-        self.assertEqual([item["method"] for item in bot.sent_requests], ["sendMessage", "sendMessage"])
-        self.assertIn("truncated twice but longer", bot.sent_requests[0]["payload"]["text"])
-        self.assertIn("may be incomplete because the model hit its output limit", bot.sent_requests[1]["payload"]["text"])
+        self.assertEqual([item["method"] for item in bot.sent_requests], ["sendMessage", "sendMessage", "sendMessage"])
+        self.assertIn("working on a reply", bot.sent_requests[0]["payload"]["text"])
+        self.assertIn("truncated twice but longer", bot.sent_requests[1]["payload"]["text"])
+        self.assertIn("may be incomplete because the model hit its output limit", bot.sent_requests[2]["payload"]["text"])
 
     def test_process_update_sends_notice_when_chunks_not_fully_delivered(self):
         paragraph = "**Heading** " + ("word " * 500)
@@ -495,10 +576,22 @@ class BotTestCase(unittest.TestCase):
 
         bot.process_update(self.make_update("@chatgpt_on_tg_bot long answer"))
 
-        self.assertEqual(len(bot.sent_requests), 2)
+        self.assertEqual(len(bot.sent_requests), 3)
         self.assertEqual(bot.sent_requests[0]["method"], "sendMessage")
-        self.assertEqual(bot.sent_requests[1]["method"], "sendMessage")
-        self.assertIn("could not deliver the full reply", bot.sent_requests[1]["payload"]["text"])
+        self.assertIn("working on a reply", bot.sent_requests[0]["payload"]["text"])
+        self.assertEqual(bot.sent_requests[2]["method"], "sendMessage")
+        self.assertIn("could not deliver the full reply", bot.sent_requests[2]["payload"]["text"])
+
+    def test_process_update_sends_notice_when_generation_fails(self):
+        store = SQLiteStore(self.db_path)
+        bot = GenerationFailureTelegramBot(self.settings, store, RuntimeError("simulated generation failure"))
+        self.addCleanup(bot.close)
+
+        bot.process_update(self.make_update("@chatgpt_on_tg_bot fail please"))
+
+        self.assertEqual([item["method"] for item in bot.sent_requests], ["sendMessage", "sendMessage"])
+        self.assertIn("working on a reply", bot.sent_requests[0]["payload"]["text"])
+        self.assertIn("hit an error while generating or sending the reply", bot.sent_requests[1]["payload"]["text"])
 
 
 if __name__ == "__main__":
